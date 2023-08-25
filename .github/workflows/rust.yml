@@ -13,7 +13,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUSTFLAGS: -Dwarnings
-  FFMPEG_DIR: $HOME/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0
+  FFMPEG_DIR: "$HOME/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0"
 
 jobs:
   fmt-check-test:
@@ -24,17 +24,30 @@ jobs:
       - name: Download FFmpeg prebuilt
         run: |
           mkdir $HOME/ffmpeg
-          cd $HOME
-          ls
-          echo "----"
           cd $HOME/ffmpeg
           wget --quiet https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0.tar.xz
           tar -xJf ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0.tar.xz
-          ls ..
+
+      - name: Show
+        run: |
+          cd $HOME/ffmpeg
+          pwd
           echo "===="
           ls
-          cd ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0
-          ls
+          cd ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0/
+          echo "========1"
+          ls "include/libavutil/av*" || true
+          echo "========2"
+          ls "$HOME/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0" || true
+          echo "========3"
+          echo '- ls $FFMPEG_DIR'
+          ls "$FFMPEG_DIR" || true
+          echo "========4"
+          echo "home =" $HOME
+          echo '- ls $FFMPEG_DIR/include/libavutil'
+          ls $FFMPEG_DIR/include/libavutil/av* || true
+          echo "========5"
+          ls /home/runner/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0/include/libavutil/av*
 
       - name: Install dependencies
         run: |
@@ -55,4 +68,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy
+        run: |
+          echo $FFMPEG_DIR
+          export FFMPEG_DIR="$HOME/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0"
+          cargo clippy
