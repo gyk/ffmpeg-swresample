@@ -23,11 +23,13 @@ jobs:
 
       - name: Download FFmpeg prebuilt
         run: |
-          mkdir $HOME/ffmpeg & cd $HOME
+          mkdir $HOME/ffmpeg & cd $HOME/ffmpeg
           wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0.tar.xz
           tar -xJf ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0.tar.xz
-          ls .
-          cd ffmpeg-n6.0-latest-linux64-lgpl-shared
+          ls ..
+          echo "===="
+          ls
+          cd ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0
           ls
 
       - name: Install dependencies
