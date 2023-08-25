@@ -85,6 +85,6 @@ fn downsample_audio_impl(path: &Path) -> Result<Vec<i16>> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let p = args[1].parse::<PathBuf>()?;
-    println!("{}", downsample_audio(&p)?.len());
+    println!("{}", downsample_audio(p)?.len());
     Ok(())
 }

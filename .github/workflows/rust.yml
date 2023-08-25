@@ -13,7 +13,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUSTFLAGS: -Dwarnings
-  FFMPEG_DIR: "$HOME/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0"
+  FFMPEG: ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0
+  FFMPEG_DIR: "${{ env.HOME }}/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0"
+  FFMPEG_DIR2: ${{ env.HOME }}/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0
 
 jobs:
   fmt-check-test:
@@ -25,18 +27,22 @@ jobs:
         run: |
           mkdir $HOME/ffmpeg
           cd $HOME/ffmpeg
-          wget --quiet https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0.tar.xz
-          tar -xJf ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0.tar.xz
+          wget --quiet https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$FFMPEG.tar.xz
+          tar -xJf $FFMPEG.tar.xz
 
       - name: Show
         run: |
           cd $HOME/ffmpeg
           pwd
           echo "===="
+          echo $FFMPEG_DIR
+          echo $FFMPEG_DIR2
+          echo "===="
           ls
           cd ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0/
+          pwd
           echo "========1"
-          ls "include/libavutil/av*" || true
+          ls ./include/libavutil/av* || true
           echo "========2"
           ls "$HOME/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0" || true
           echo "========3"
