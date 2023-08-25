@@ -13,7 +13,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUSTFLAGS: -Dwarnings
-  FFMPEG_DIR: $HOME/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared
+  FFMPEG_DIR: $HOME/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0
 
 jobs:
   fmt-check-test:
@@ -28,7 +28,7 @@ jobs:
           ls
           echo "----"
           cd $HOME/ffmpeg
-          wget https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0.tar.xz
+          wget --quiet https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0.tar.xz
           tar -xJf ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0.tar.xz
           ls ..
           echo "===="
