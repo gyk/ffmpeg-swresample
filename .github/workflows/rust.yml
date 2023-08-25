@@ -27,17 +27,14 @@ jobs:
           cd $HOME/ffmpeg
           wget --quiet https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/$FFMPEG.tar.xz
           tar -xJf $FFMPEG.tar.xz
+          echo "FFMPEG_DIR=$HOME/ffmpeg/$FFMPEG" >> $GITHUB_ENV
 
       - name: Show
-        env:
-          FFMPEG_DIR: "${{ env.HOME }}/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0"
-          FFMPEG_DIR2: ${{ env.HOME }}/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0
         run: |
           cd $HOME/ffmpeg
           pwd
           echo "===="
           echo $FFMPEG_DIR
-          echo $FFMPEG_DIR2
           echo "===="
           ls
           cd ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0/
@@ -53,8 +50,6 @@ jobs:
           echo "home =" $HOME
           echo '- ls $FFMPEG_DIR/include/libavutil'
           ls $FFMPEG_DIR/include/libavutil/av* || true
-          echo "========5"
-          ls /home/runner/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0/include/libavutil/av*
 
       - name: Install dependencies
         run: |
@@ -75,9 +70,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        env:
-          FFMPEG_DIR: "${{ env.HOME }}/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0"
         run: |
           echo $FFMPEG_DIR
-          export FFMPEG_DIR="$HOME/ffmpeg/ffmpeg-n6.0-latest-linux64-lgpl-shared-6.0"
+          export FFMPEG_DIR="$HOME/ffmpeg/$FFMPEG"
           cargo clippy
