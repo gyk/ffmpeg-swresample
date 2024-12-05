@@ -26,7 +26,7 @@ pub fn downsample_audio<P: AsRef<Path>>(path: P) -> Result<Vec<i16>> {
 fn downsample_audio_impl(path: &Path) -> Result<Vec<i16>> {
     INIT_FFMPEG.call_once(init_ffmpeg);
 
-    let mut input_ctx = ffmpeg::format::input(&path)?;
+    let mut input_ctx = ffmpeg::format::input(path)?;
     let a_stream = input_ctx
         .streams()
         .best(ffmpeg::media::Type::Audio)
@@ -82,9 +82,60 @@ fn downsample_audio_impl(path: &Path) -> Result<Vec<i16>> {
     Ok(wave_samples)
 }
 
+use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream};
+use std::io::{self, prelude::*, BufReader};
+
+// See https://github.com/kotauskas/interprocess/blob/main/examples/local_socket/sync/listener.rs
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let p = args[1].parse::<PathBuf>()?;
-    println!("{}", downsample_audio(p)?.len());
+    // Connections may fail on initialization for one reason or another.
+    fn handle_error(conn: io::Result<Stream>) -> Option<Stream> {
+        match conn {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("Incoming connection failed: {e}");
+                None
+            }
+        }
+    }
+
+    let socket_name = "ffmpeg-swresample.socks";
+    let name = socket_name.to_ns_name::<GenericNamespaced>()?;
+
+    let opts = ListenerOptions::new().name(name);
+
+    let listener = match opts.create_sync() {
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            eprintln!(
+                "Error: could not start server because the socket file is occupied. Please check if
+                {socket_name} is in use by another process and try again."
+            );
+            panic!("TODO: handle this error");
+            // return Err(e);
+        }
+        res => res?,
+    };
+
+    eprintln!("Server running at {socket_name}");
+
+    let mut buffer = String::with_capacity(128);
+
+    for conn in listener.incoming().filter_map(handle_error) {
+        let mut conn = BufReader::new(conn);
+        println!("Incoming connection!");
+
+        conn.read_line(&mut buffer)?;
+        // Beware of the newline
+        buffer.truncate(buffer.trim_end().len());
+
+        let p = buffer.parse::<PathBuf>()?;
+        let samples = downsample_audio(p)?;
+
+        let bytes = unsafe { samples.align_to::<u8>().1 };
+
+        conn.get_mut().write_all(bytes)?;
+        println!("Client answered: {buffer}");
+        buffer.clear();
+    }
+
     Ok(())
 }
