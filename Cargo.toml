@@ -1,5 +1,5 @@
 [package]
-name = "ffmpeg6-swresample"
+name = "ffmpeg-swresample"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,4 +7,4 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-ffmpeg = { package = "ffmpeg-next", version = "6.0.0" }
+ffmpeg = { package = "ffmpeg-next", version = "7.1.0" }
