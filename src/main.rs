@@ -41,9 +41,19 @@ fn downsample_audio_impl(path: &Path) -> Result<Vec<i16>> {
 
     // When channel layout is 0 (e.g., some WAV files), set it to the default value. See
     // https://stackoverflow.com/q/20001363.
+    let mut should_copy_channel_layout = false;
     if decoder.channel_layout().bits() == 0 {
         decoder.set_channel_layout(ffmpeg::ChannelLayout::default(decoder.channels() as i32));
+        should_copy_channel_layout = true;
     }
+
+    use ffmpeg::sys::{av_channel_layout_copy, AVChannelLayout, AVChannelOrder};
+    let in_ch_layout = AVChannelLayout {
+        order: AVChannelOrder::AV_CHANNEL_ORDER_NATIVE,
+        nb_channels: decoder.channel_layout().channels(),
+        u: unsafe { std::mem::transmute_copy(&decoder.channel_layout().bits()) },
+        opaque: std::ptr::null_mut(),
+    };
 
     let mut resampler_ctx = ffmpeg::software::resampling::Context::get(
         decoder.format(),
@@ -69,6 +79,16 @@ fn downsample_audio_impl(path: &Path) -> Result<Vec<i16>> {
 
         if decoder.receive_frame(&mut a_frame).is_ok() {
             debug_assert!(a_frame.is_key());
+
+            if should_copy_channel_layout {
+                // Prevent "Input changed" error after FFmpeg switches to new channel layout API.
+                unsafe {
+                    av_channel_layout_copy(
+                        &mut (*a_frame.as_mut_ptr()).ch_layout as _,
+                        &in_ch_layout as _,
+                    );
+                }
+            }
 
             let mut downsampled = Audio::empty();
 
