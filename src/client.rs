@@ -1,53 +1,70 @@
+use std::io::{self, stdin, BufRead};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
+use crossbeam_channel::{bounded, select, Receiver};
 use iceoryx2::{
     port::{
-        listener::Listener, notifier::Notifier, publisher::Publisher,
+        listener::Listener, notifier::Notifier, publisher::Publisher, subscriber::Subscriber,
         update_connections::UpdateConnections,
     },
     prelude::*,
+    sample::Sample as IpcSample,
 };
 
 mod common;
 mod events;
 
-use common::SERVICE_NAME;
+use common::*;
 use events::IpcEvent;
 
-const CYCLE_TIME: Duration = Duration::from_secs(1);
-const HISTORY_SIZE: usize = 20;
+const DEADLINE: Duration = Duration::from_secs(30);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
-    let path = &args[1];
+    let _args: Vec<String> = std::env::args().collect();
 
-    let node = NodeBuilder::new().create::<ipc::Service>()?;
-    let service_name: ServiceName = SERVICE_NAME.try_into()?;
-    let ipc_client = IpcClient::new(&node, &service_name)?;
+    let (ctrlc_tx, ctrlc_rx) = bounded(0);
+    ctrlc::set_handler(move || {
+        println!("Ctrl+C pressed!");
+        ctrlc_tx
+            .send(())
+            .expect("Could not send signal on channel.")
+    })
+    .expect("Error setting Ctrl-C handler");
+
+    let stdin_rx = spawn_stdin_chan();
+
+    // ipc::Service::list(Config::global_config(), |service| {
+    //     println!("\n{:#?}", &service);
+    //     CallbackProgression::Continue
+    // })?;
+
+    let node = NodeBuilder::new()
+        // .signal_handling_mode(SignalHandlingMode::Disabled)
+        .create::<ipc::Service>()?;
+    let ipc_client = IpcClient::new(&node, stdin_rx, ctrlc_rx)?;
 
     let waitset = WaitSetBuilder::new().create::<ipc::Service>()?;
-    let publisher_guard = waitset.attach_notification(&ipc_client)?;
-    let cyclic_trigger_guard = waitset.attach_interval(CYCLE_TIME)?;
+    // let client_guard = waitset.attach_deadline(&ipc_client, DEADLINE)?;
+    let client_guard = waitset.attach_notification(&ipc_client)?;
 
-    let mut sent = false;
-
-    let on_event = |attachment_id: WaitSetAttachmentId<ipc::Service>| {
-        if attachment_id.has_event_from(&cyclic_trigger_guard) {
-            if !sent {
-                println!("Send message");
-                ipc_client.send(path).unwrap();
-                sent = true;
-            }
-        } else if attachment_id.has_event_from(&publisher_guard) {
+    let mut on_event = |attachment_id: WaitSetAttachmentId<ipc::Service>| {
+        if attachment_id.has_event_from(&client_guard) {
             ipc_client.handle_event().unwrap();
+        } else if attachment_id.has_missed_deadline(&client_guard) {
+            println!(
+                "⚠️ The server did not respond a message for {:?}.",
+                DEADLINE
+            );
+            return CallbackProgression::Stop;
         }
+
         CallbackProgression::Continue
     };
 
-    // Start the event loop. It will run until `CallbackProgression::Stop` is returned by the
-    // event callback or an interrupt/termination signal was received.
-    waitset.wait_and_process(on_event)?;
+    waitset.wait_and_process(&mut on_event)?;
 
     println!("exit");
     Ok(())
@@ -55,9 +72,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Debug)]
 struct IpcClient {
+    // IPC
     publisher: Publisher<ipc::Service, [u8], ()>,
+    subscriber: Subscriber<ipc::Service, [u8], ()>,
     listener: Listener<ipc::Service>,
     notifier: Notifier<ipc::Service>,
+
+    // State
+    is_server_running: AtomicBool,
+
+    // User input
+    stdin_rx: Receiver<io::Result<String>>,
+    ctrlc_rx: Receiver<()>,
 }
 
 impl FileDescriptorBased for IpcClient {
@@ -71,24 +97,38 @@ impl SynchronousMultiplexing for IpcClient {}
 impl IpcClient {
     fn new(
         node: &Node<ipc::Service>,
-        service_name: &ServiceName,
+        stdin_rx: Receiver<io::Result<String>>,
+        ctrlc_rx: Receiver<()>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let pubsub_service = node
-            .service_builder(service_name)
+        let s2c_service_name: ServiceName = S2C_SERVICE_NAME.try_into()?;
+        let s2c_service = node
+            .service_builder(&s2c_service_name)
             .publish_subscribe::<[u8]>()
             .history_size(HISTORY_SIZE)
             .subscriber_max_buffer_size(HISTORY_SIZE)
-            .open_or_create()?;
+            .open_or_create()
+            .unwrap();
+        let event_service_name = EVENT_SERVICE_NAME.try_into()?;
         let event_service = node
-            .service_builder(service_name)
+            .service_builder(&event_service_name)
             .event()
             .open_or_create()?;
 
         let listener = event_service.listener_builder().create()?;
         let notifier = event_service.notifier_builder().create()?;
-        let publisher = pubsub_service
+        let subscriber = s2c_service.subscriber_builder().create()?;
+
+        let c2s_service_name: ServiceName = C2S_SERVICE_NAME.try_into()?;
+        let c2s_service = node
+            .service_builder(&c2s_service_name)
+            .publish_subscribe::<[u8]>()
+            .history_size(HISTORY_SIZE)
+            .subscriber_max_buffer_size(HISTORY_SIZE)
+            .open_or_create()?;
+
+        let publisher = c2s_service
             .publisher_builder()
-            .initial_max_slice_len(16)
+            .initial_max_slice_len(SLICE_SIZE_HINT)
             .allocation_strategy(AllocationStrategy::PowerOfTwo)
             .create()?;
 
@@ -96,8 +136,14 @@ impl IpcClient {
 
         Ok(Self {
             publisher,
+            subscriber,
             listener,
             notifier,
+
+            is_server_running: AtomicBool::new(false),
+
+            stdin_rx,
+            ctrlc_rx,
         })
     }
 
@@ -111,25 +157,62 @@ impl IpcClient {
                 }
                 IpcEvent::ServerDisconnected => {
                     println!("Server disconnected");
+                    self.is_server_running.store(false, Ordering::SeqCst);
                 }
                 IpcEvent::RequestReceived => {
                     println!("Server has received request");
                 }
-                _ => (),
+                IpcEvent::ResponseSent => {
+                    if let Ok(Some(sample)) = self.receive() {
+                        println!("RESP received: len = {}", sample.payload().len());
+                        let data: &[u8] = sample.payload();
+                        let waveform_slice = unsafe {
+                            let (prefix, u8_slice, suffix) = data.align_to::<u16>();
+                            assert!(prefix.is_empty() && suffix.is_empty());
+                            u8_slice
+                        };
+                        println!("waveform: len = {}", waveform_slice.len());
+                    }
+                }
+                IpcEvent::ServerReady => {
+                    println!("Please input the path to audio file");
+                    if let Some(input) = read_line(&self.stdin_rx, &self.ctrlc_rx) {
+                        let _ = self.send(input.as_bytes());
+                    } else {
+                        break;
+                    }
+                }
+                meh => {
+                    println!("🤷‍♂️ {:?}", meh);
+                }
             }
         }
 
         Ok(())
     }
 
-    fn send(&self, path: &str) -> Result<()> {
-        let sample = self.publisher.loan_slice_uninit(path.len())?;
-        let sample = sample.write_from_slice(path.as_bytes());
+    fn send(&self, data: &[u8]) -> Result<()> {
+        println!("📤 Client send {}", data.len());
+        let sample = self.publisher.loan_slice_uninit(data.len())?;
+        let sample = sample.write_from_slice(data);
         sample.send()?;
 
         self.notifier
             .notify_with_custom_event_id(IpcEvent::RequestSent.into())?;
         Ok(())
+    }
+
+    fn receive(
+        &self,
+    ) -> Result<Option<IpcSample<ipc::Service, [u8], ()>>, Box<dyn std::error::Error>> {
+        match self.subscriber.receive()? {
+            Some(sample) => {
+                self.notifier
+                    .notify_with_custom_event_id(IpcEvent::ResponseReceived.into())?;
+                Ok(Some(sample))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -138,5 +221,33 @@ impl Drop for IpcClient {
         let _ = self
             .notifier
             .notify_with_custom_event_id(IpcEvent::ClientDisconnected.into());
+    }
+}
+
+// ===== User input & Signal handling ===== //
+
+fn spawn_stdin_chan() -> Receiver<io::Result<String>> {
+    let (tx, rx) = bounded(0);
+    thread::spawn(move || {
+        let stdin = stdin();
+        for line in stdin.lock().lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+fn read_line(stdin_rx: &Receiver<io::Result<String>>, ctrlc_rx: &Receiver<()>) -> Option<String> {
+    select! {
+        recv(ctrlc_rx) -> _signal => {
+            eprintln!("Ctrl+C pressed");
+            None
+        },
+        recv(stdin_rx) -> line => match line {
+            Ok(line) => line.ok(),
+            Err(_) => None,
+        }
     }
 }

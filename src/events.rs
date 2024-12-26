@@ -5,18 +5,19 @@ use num_enum::TryFromPrimitive;
 #[repr(usize)]
 pub enum IpcEvent {
     ServerConnected = 0,
-    ServerDisconnected = 1,
-    ClientConnected = 2,
-    ClientDisconnected = 3,
+    ServerDisconnected,
+    ClientConnected,
+    ClientDisconnected,
 
-    RequestSent = 4,
-    RequestReceived = 5,
-    ResponseSent = 6,
-    ResponseReceived = 7,
+    RequestSent,
+    RequestReceived,
+    ResponseSent,
+    ResponseReceived,
 
-    ProcessDied = 8,
+    ServerReady,
+    ProcessDied,
 
-    Unknown,
+    Unknown = usize::MAX,
 }
 
 impl From<IpcEvent> for EventId {

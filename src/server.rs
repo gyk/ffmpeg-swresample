@@ -11,18 +11,20 @@ use ffmpeg::util::frame::Audio;
 use ffmpeg::util::log::level::Level;
 
 use iceoryx2::{
-    port::{listener::Listener, notifier::Notifier, subscriber::Subscriber},
+    port::{
+        listener::Listener, notifier::Notifier, publisher::Publisher, subscriber::Subscriber,
+        update_connections::UpdateConnections,
+    },
     prelude::*,
     sample::Sample as IpcSample,
 };
 
-const HISTORY_SIZE: usize = 20;
-const DEADLINE: Duration = Duration::from_secs(10);
+const DEADLINE: Duration = Duration::from_secs(15);
 
 mod common;
 mod events;
 
-use common::SERVICE_NAME;
+use common::*;
 use events::IpcEvent;
 
 static INIT_FFMPEG: Once = Once::new();
@@ -120,18 +122,19 @@ fn downsample_audio_impl(path: &Path) -> Result<Vec<i16>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let node = NodeBuilder::new().create::<ipc::Service>()?;
-    let service_name: ServiceName = SERVICE_NAME.try_into()?;
-    let ipc_server = IpcServer::new(&node, &service_name)?;
+    let node = NodeBuilder::new()
+        // .signal_handling_mode(SignalHandlingMode::Disabled)
+        .create::<ipc::Service>()?;
+    let ipc_server = IpcServer::new(&node)?;
 
     let waitset = WaitSetBuilder::new().create::<ipc::Service>()?;
 
-    let subscriber_guard = waitset.attach_deadline(&ipc_server, DEADLINE)?;
+    let server_guard = waitset.attach_deadline(&ipc_server, DEADLINE)?;
 
     let on_event = |attachment_id: WaitSetAttachmentId<ipc::Service>| {
-        if attachment_id.has_event_from(&subscriber_guard) {
+        if attachment_id.has_event_from(&server_guard) {
             ipc_server.handle_event().unwrap();
-        } else if attachment_id.has_missed_deadline(&subscriber_guard) {
+        } else if attachment_id.has_missed_deadline(&server_guard) {
             if ipc_server.n_clients.load(Ordering::SeqCst) == 0 {
                 return CallbackProgression::Stop;
             }
@@ -155,6 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct IpcServer {
     n_clients: AtomicUsize,
     subscriber: Subscriber<ipc::Service, [u8], ()>,
+    publisher: Publisher<ipc::Service, [u8], ()>,
     notifier: Notifier<ipc::Service>,
     listener: Listener<ipc::Service>,
 }
@@ -168,30 +172,44 @@ impl FileDescriptorBased for IpcServer {
 impl SynchronousMultiplexing for IpcServer {}
 
 impl IpcServer {
-    fn new(
-        node: &Node<ipc::Service>,
-        service_name: &ServiceName,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let pubsub_service = node
-            .service_builder(service_name)
+    fn new(node: &Node<ipc::Service>) -> Result<Self, Box<dyn std::error::Error>> {
+        let c2s_service_name: ServiceName = C2S_SERVICE_NAME.try_into()?;
+        let c2s_service = node
+            .service_builder(&c2s_service_name)
             .publish_subscribe::<[u8]>()
             .history_size(HISTORY_SIZE)
             .subscriber_max_buffer_size(HISTORY_SIZE)
             .open_or_create()?;
+        let event_service_name = EVENT_SERVICE_NAME.try_into()?;
         let event_service = node
-            .service_builder(service_name)
+            .service_builder(&event_service_name)
             .event()
             .open_or_create()?;
 
         let listener = event_service.listener_builder().create()?;
         let notifier = event_service.notifier_builder().create()?;
-        let subscriber = pubsub_service.subscriber_builder().create()?;
+        let subscriber = c2s_service.subscriber_builder().create()?;
+
+        let s2c_service_name: ServiceName = S2C_SERVICE_NAME.try_into()?;
+        let s2c_service = node
+            .service_builder(&s2c_service_name)
+            .publish_subscribe::<[u8]>()
+            .history_size(HISTORY_SIZE)
+            .subscriber_max_buffer_size(HISTORY_SIZE)
+            .open_or_create()?;
+
+        let publisher = s2c_service
+            .publisher_builder()
+            .initial_max_slice_len(SLICE_SIZE_HINT)
+            .allocation_strategy(AllocationStrategy::PowerOfTwo)
+            .create()?;
 
         notifier.notify_with_custom_event_id(IpcEvent::ServerConnected.into())?;
 
         Ok(Self {
             n_clients: AtomicUsize::new(0),
             subscriber,
+            publisher,
             listener,
             notifier,
         })
@@ -202,23 +220,43 @@ impl IpcServer {
             let event: IpcEvent = event.into();
             match event {
                 IpcEvent::RequestSent => {
-                    while let Ok(Some(sample)) = self.receive() {
+                    if let Ok(Some(sample)) = self.receive() {
                         println!("received: len = {}", sample.payload().len());
                         let path_u8_slice: &[u8] = sample.payload();
-                        let s = std::str::from_utf8(path_u8_slice)?;
+                        let s = std::str::from_utf8(path_u8_slice)?.trim();
                         let downsampled = downsample_audio(Path::new(s))?;
                         println!("downsampled: len = {}", downsampled.len());
+
+                        if cfg!(target_endian = "big") {
+                            panic!("Not supported on big-endian machine");
+                        }
+
+                        let data = unsafe {
+                            let (prefix, u8_slice, suffix) = downsampled.align_to::<u8>();
+                            assert!(prefix.is_empty() && suffix.is_empty());
+                            u8_slice
+                        };
+                        self.send(data).unwrap();
                     }
                 }
                 IpcEvent::ClientConnected => {
                     println!("new client connected");
                     self.n_clients.fetch_add(1, Ordering::SeqCst);
+                    self.publisher.update_connections().unwrap();
+                    self.notifier
+                        .notify_with_custom_event_id(IpcEvent::ServerReady.into())?;
                 }
                 IpcEvent::ClientDisconnected => {
                     println!("client disconnected");
                     self.n_clients.fetch_sub(1, Ordering::SeqCst);
                 }
-                _ => (),
+                IpcEvent::ResponseReceived => {
+                    self.notifier
+                        .notify_with_custom_event_id(IpcEvent::ServerReady.into())?;
+                }
+                not_interested => {
+                    println!("🙈 not my business {:?}", not_interested);
+                }
             }
         }
 
@@ -236,6 +274,16 @@ impl IpcServer {
             }
             None => Ok(None),
         }
+    }
+
+    fn send(&self, data: &[u8]) -> Result<()> {
+        let sample = self.publisher.loan_slice_uninit(data.len())?;
+        let sample = sample.write_from_slice(data);
+        sample.send()?;
+
+        self.notifier
+            .notify_with_custom_event_id(IpcEvent::ResponseSent.into())?;
+        Ok(())
     }
 }
 
