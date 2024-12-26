@@ -1,5 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use ffmpeg::format::Sample;
@@ -7,6 +9,18 @@ use ffmpeg::sys::AV_TIME_BASE;
 use ffmpeg::util::channel_layout::ChannelLayout;
 use ffmpeg::util::frame::Audio;
 use ffmpeg::util::log::level::Level;
+
+use iceoryx2::{
+    port::{listener::Listener, notifier::Notifier, subscriber::Subscriber},
+    prelude::*,
+    sample::Sample as IpcSample,
+};
+
+const HISTORY_SIZE: usize = 20;
+const DEADLINE: Duration = Duration::from_secs(10);
+
+mod events;
+use events::IpcEvent;
 
 static INIT_FFMPEG: Once = Once::new();
 
@@ -102,60 +116,130 @@ fn downsample_audio_impl(path: &Path) -> Result<Vec<i16>> {
     Ok(wave_samples)
 }
 
-use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream};
-use std::io::{self, prelude::*, BufReader};
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let node = NodeBuilder::new().create::<ipc::Service>()?;
+    let service_name: ServiceName = "Audio Thumbnail Making Service".try_into()?;
+    let ipc_server = IpcServer::new(&node, &service_name)?;
 
-// See https://github.com/kotauskas/interprocess/blob/main/examples/local_socket/sync/listener.rs
-fn main() -> Result<()> {
-    // Connections may fail on initialization for one reason or another.
-    fn handle_error(conn: io::Result<Stream>) -> Option<Stream> {
-        match conn {
-            Ok(c) => Some(c),
-            Err(e) => {
-                eprintln!("Incoming connection failed: {e}");
-                None
+    let waitset = WaitSetBuilder::new().create::<ipc::Service>()?;
+
+    let subscriber_guard = waitset.attach_deadline(&ipc_server, DEADLINE)?;
+
+    let on_event = |attachment_id: WaitSetAttachmentId<ipc::Service>| {
+        if attachment_id.has_event_from(&subscriber_guard) {
+            ipc_server.handle_event().unwrap();
+        } else if attachment_id.has_missed_deadline(&subscriber_guard) {
+            if ipc_server.n_clients.load(Ordering::SeqCst) == 0 {
+                return CallbackProgression::Stop;
             }
-        }
-    }
 
-    let socket_name = "ffmpeg-swresample.socks";
-    let name = socket_name.to_ns_name::<GenericNamespaced>()?;
-
-    let opts = ListenerOptions::new().name(name);
-
-    let listener = match opts.create_sync() {
-        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!(
-                "Error: could not start server because the socket file is occupied. Please check if
-                {socket_name} is in use by another process and try again."
+            println!(
+                "⚠️ The subscriber did not receive a message for {:?}.",
+                DEADLINE
             );
-            panic!("TODO: handle this error");
-            // return Err(e);
         }
-        res => res?,
+
+        CallbackProgression::Continue
     };
 
-    eprintln!("Server running at {socket_name}");
+    waitset.wait_and_process(on_event)?;
 
-    let mut buffer = String::with_capacity(128);
+    println!("exit");
+    Ok(())
+}
 
-    for conn in listener.incoming().filter_map(handle_error) {
-        let mut conn = BufReader::new(conn);
-        println!("Incoming connection!");
+#[derive(Debug)]
+struct IpcServer {
+    n_clients: AtomicUsize,
+    subscriber: Subscriber<ipc::Service, [u8], ()>,
+    notifier: Notifier<ipc::Service>,
+    listener: Listener<ipc::Service>,
+}
 
-        conn.read_line(&mut buffer)?;
-        // Beware of the newline
-        buffer.truncate(buffer.trim_end().len());
+impl FileDescriptorBased for IpcServer {
+    fn file_descriptor(&self) -> &FileDescriptor {
+        self.listener.file_descriptor()
+    }
+}
 
-        let p = buffer.parse::<PathBuf>()?;
-        let samples = downsample_audio(p)?;
+impl SynchronousMultiplexing for IpcServer {}
 
-        let bytes = unsafe { samples.align_to::<u8>().1 };
+impl IpcServer {
+    fn new(
+        node: &Node<ipc::Service>,
+        service_name: &ServiceName,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let pubsub_service = node
+            .service_builder(service_name)
+            .publish_subscribe::<[u8]>()
+            .history_size(HISTORY_SIZE)
+            .subscriber_max_buffer_size(HISTORY_SIZE)
+            .open_or_create()?;
+        let event_service = node
+            .service_builder(service_name)
+            .event()
+            .open_or_create()?;
 
-        conn.get_mut().write_all(bytes)?;
-        println!("Client answered: {buffer}");
-        buffer.clear();
+        let listener = event_service.listener_builder().create()?;
+        let notifier = event_service.notifier_builder().create()?;
+        let subscriber = pubsub_service.subscriber_builder().create()?;
+
+        notifier.notify_with_custom_event_id(IpcEvent::ServerConnected.into())?;
+
+        Ok(Self {
+            n_clients: AtomicUsize::new(0),
+            subscriber,
+            listener,
+            notifier,
+        })
     }
 
-    Ok(())
+    fn handle_event(&self) -> Result<(), Box<dyn std::error::Error>> {
+        while let Some(event) = self.listener.try_wait_one()? {
+            let event: IpcEvent = event.into();
+            match event {
+                IpcEvent::RequestSent => {
+                    while let Ok(Some(sample)) = self.receive() {
+                        println!("received: len = {}", sample.payload().len());
+                        let path_u8_slice: &[u8] = sample.payload();
+                        let s = std::str::from_utf8(path_u8_slice)?;
+                        let downsampled = downsample_audio(Path::new(s))?;
+                        println!("downsampled: len = {}", downsampled.len());
+                    }
+                }
+                IpcEvent::ClientConnected => {
+                    println!("new client connected");
+                    self.n_clients.fetch_add(1, Ordering::SeqCst);
+                }
+                IpcEvent::ClientDisconnected => {
+                    println!("client disconnected");
+                    self.n_clients.fetch_sub(1, Ordering::SeqCst);
+                }
+                _ => (),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn receive(
+        &self,
+    ) -> Result<Option<IpcSample<ipc::Service, [u8], ()>>, Box<dyn std::error::Error>> {
+        match self.subscriber.receive()? {
+            Some(sample) => {
+                self.notifier
+                    .notify_with_custom_event_id(IpcEvent::RequestReceived.into())?;
+                Ok(Some(sample))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+impl Drop for IpcServer {
+    fn drop(&mut self) {
+        self.notifier
+            .notify_with_custom_event_id(IpcEvent::ServerDisconnected.into())
+            .unwrap();
+    }
 }
