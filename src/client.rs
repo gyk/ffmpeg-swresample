@@ -9,7 +9,10 @@ use iceoryx2::{
     prelude::*,
 };
 
+mod common;
 mod events;
+
+use common::SERVICE_NAME;
 use events::IpcEvent;
 
 const CYCLE_TIME: Duration = Duration::from_secs(1);
@@ -20,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = &args[1];
 
     let node = NodeBuilder::new().create::<ipc::Service>()?;
-    let service_name: ServiceName = "Audio Thumbnail Making Service".try_into()?;
+    let service_name: ServiceName = SERVICE_NAME.try_into()?;
     let ipc_client = IpcClient::new(&node, &service_name)?;
 
     let waitset = WaitSetBuilder::new().create::<ipc::Service>()?;

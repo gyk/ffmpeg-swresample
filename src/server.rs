@@ -19,7 +19,10 @@ use iceoryx2::{
 const HISTORY_SIZE: usize = 20;
 const DEADLINE: Duration = Duration::from_secs(10);
 
+mod common;
 mod events;
+
+use common::SERVICE_NAME;
 use events::IpcEvent;
 
 static INIT_FFMPEG: Once = Once::new();
@@ -118,7 +121,7 @@ fn downsample_audio_impl(path: &Path) -> Result<Vec<i16>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node = NodeBuilder::new().create::<ipc::Service>()?;
-    let service_name: ServiceName = "Audio Thumbnail Making Service".try_into()?;
+    let service_name: ServiceName = SERVICE_NAME.try_into()?;
     let ipc_server = IpcServer::new(&node, &service_name)?;
 
     let waitset = WaitSetBuilder::new().create::<ipc::Service>()?;
