@@ -1,4 +1,5 @@
-use std::path::{Path, PathBuf};
+use core::panic;
+use std::path::Path;
 use std::sync::Once;
 
 use anyhow::{anyhow, Result};
@@ -102,60 +103,34 @@ fn downsample_audio_impl(path: &Path) -> Result<Vec<i16>> {
     Ok(wave_samples)
 }
 
-use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream};
-use std::io::{self, prelude::*, BufReader};
+// ===== IPC ===== //
 
-// See https://github.com/kotauskas/interprocess/blob/main/examples/local_socket/sync/listener.rs
-fn main() -> Result<()> {
-    // Connections may fail on initialization for one reason or another.
-    fn handle_error(conn: io::Result<Stream>) -> Option<Stream> {
-        match conn {
-            Ok(c) => Some(c),
-            Err(e) => {
-                eprintln!("Incoming connection failed: {e}");
-                None
-            }
-        }
-    }
+use ipc_channel::ipc::{self, *};
 
-    let socket_name = "ffmpeg-swresample.socks";
-    let name = socket_name.to_ns_name::<GenericNamespaced>()?;
+use crate::messages::{Request, Response};
 
-    let opts = ListenerOptions::new().name(name);
+pub fn run(handshake_id: String) -> Result<()> {
+    let handshake_server_name = handshake_id;
+    let (req_tx, req_rx): (IpcSender<Request>, IpcReceiver<Request>) = ipc::channel().unwrap();
 
-    let listener = match opts.create_sync() {
-        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!(
-                "Error: could not start server because the socket file is occupied. Please check if
-                {socket_name} is in use by another process and try again."
-            );
-            panic!("TODO: handle this error");
-            // return Err(e);
-        }
-        res => res?,
+    let handshake_tx = IpcSender::connect(handshake_server_name).unwrap();
+    handshake_tx.send(req_tx).unwrap();
+
+    let Request::Handshake(resp_tx) = req_rx.recv()? else {
+        panic!("Handshake request expected")
     };
 
-    eprintln!("Server running at {socket_name}");
+    loop {
+        let request = req_rx.recv()?;
 
-    let mut buffer = String::with_capacity(128);
-
-    for conn in listener.incoming().filter_map(handle_error) {
-        let mut conn = BufReader::new(conn);
-        println!("Incoming connection!");
-
-        conn.read_line(&mut buffer)?;
-        // Beware of the newline
-        buffer.truncate(buffer.trim_end().len());
-
-        let p = buffer.parse::<PathBuf>()?;
-        let samples = downsample_audio(p)?;
-
-        let bytes = unsafe { samples.align_to::<u8>().1 };
-
-        conn.get_mut().write_all(bytes)?;
-        println!("Client answered: {buffer}");
-        buffer.clear();
+        match request {
+            Request::MakeAudioThumb { path } => {
+                let buffer = downsample_audio(&path).unwrap();
+                let resp = Response::AudioThumb(buffer.to_vec());
+                resp_tx.send(resp)?;
+            }
+            Request::MakeVideoThumb { .. } => unimplemented!(),
+            Request::Handshake(..) => unreachable!(),
+        }
     }
-
-    Ok(())
 }
